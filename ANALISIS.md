@@ -1,92 +1,93 @@
 # Análisis de adquisición, almacenamiento y procesamiento (ATmega2560 + SSD1306)
 
 ## 📁 Ideas clave
-- **Ventana fija de 108 muestras** para dibujar 1:1 en el área gráfica (108×47).  
-- **Conversión ADC a 8 bits** (o 9–10 bits con compresión) para minimizar RAM sin perder detalle visual.  
-- **Escalado vertical con saturación y mapeo entero** para 0–47 px, evitando `float`.  
-- **Cálculo incremental** (min, max, suma y suma de cuadrados) para reducir CPU y RAM.  
-- **RMS y dB en fixed‑point**, usando aproximaciones o LUT para `log10` si se requiere.  
-- **Buffer lineal** simple cuando el objetivo es mostrar una sola ventana; **buffer circular** si se desea “rolling” continuo.  
-- **Separar la capa de adquisición de la de render** para simplificar y aislar la temporización.  
+- **Ventana fija de 108 muestras = ancho útil del gráfico** (108×47), sin re-muestreo adicional.
+- **Estrategia “adquirir → procesar → renderizar”** para desacoplar timing del ADC y del OLED.
+- **Preferir enteros**: el AVR no tiene FPU, así que el fixed‑point ahorra CPU y jitter.
+- **Acumuladores incrementales** (min, max, suma, suma de cuadrados) en una sola pasada.
+- **Compresión a 8 bits** para la traza (si el objetivo es visual), manteniendo 10 bits para métricas si hace falta.
+- **Buffer lineal** para ventana estática; **buffer circular** para modo “rolling”.
+- **RMS/dB**: calcular fuera del loop crítico, con LUT o aproximación si se requiere velocidad.
 
 ## 📄 Resumen de análisis
-La estrategia más eficiente para un ATmega2560 con pantalla SSD1306 es capturar **108 muestras en un arreglo lineal**, almacenar cada muestra en **`uint8_t` o `uint16_t` comprimido**, y calcular estadísticas con **procesamiento incremental** (min, max, suma, suma de cuadrados). Luego se escala a 0–47 para graficar y se trazan líneas entre puntos. Esta solución minimiza RAM, evita `float` en el ciclo crítico y mantiene el código simple. Se recomienda usar **fixed‑point** para RMS/dB y reservar `float` solo si la precisión requerida lo justifica, dado el costo en CPU y flash.  
+La opción más eficiente y simple es usar **un arreglo lineal de 108 muestras**, calcular min/max/suma/suma de cuadrados en la misma adquisición y luego escalar a 0–47 px para dibujar. Para el ATmega2560, el **fixed‑point** es ideal: mantiene CPU estable, consume menos flash y evita latencias impredecibles. Solo se recomienda usar `float` para dB si la precisión requerida lo justifica y se hace **después** de capturar la ventana. Esta estrategia minimiza RAM, mantiene el ciclo de muestreo limpio y permite una forma de onda nítida conectando puntos.
 
 ## 🧠 Razonamiento y comparación detallada
 
 ### 1) Lluvia de ideas técnica (estructuras posibles)
 - **Array fijo de 108 muestras** (`uint8_t`/`uint16_t`).
-- **Buffer circular** con índice de escritura y lectura para “scroll” continuo.
-- **Struct de señal** que agrupe muestras + metadatos (min, max, suma, etc.).
-- **Procesamiento incremental** (acumuladores) sin almacenar todo (si solo se requiere estadísticas, no forma de onda).
-- **Compresión de muestras** (mapear 10 bits a 8 bits para gráfico).
-- **Doble buffer** (uno para adquisición, otro para render) para evitar tearing.
+- **Buffer circular** con índice de escritura y lectura para desplazamiento continuo.
+- **Struct de señal** que agrupe muestras + métricas.
+- **Procesamiento incremental** (sin buffer) cuando solo importan las estadísticas.
+- **Doble buffer** para evitar tearing entre adquisición y render.
+- **Compresión** de 10 → 8 bits para gráficos, manteniendo métricas con 10 bits.
 
-### 2) Comparación detallada
+### 2) Comparación detallada (con foco en RAM/CPU)
 
 #### Arrays clásicos
 **Ventajas**:
-- Acceso directo, mínimo overhead.
-- Sencillo para trazar puntos 1:1 en pantalla.
-- Fácil de depurar.
+- Acceso directo y mínimo overhead.
+- Render inmediato (x = índice) y depuración simple.
+- RAM predecible: 108×1 B (8 bits) o 108×2 B (10 bits en `uint16_t`).
 
 **Desventajas**:
-- Para flujo continuo hay que hacer corrimientos o reinicios.
+- Para modo continuo, hay que reiniciar o copiar si se quiere “scroll”.
 
-**Cuándo usar**: capturar una ventana de 108 muestras y dibujarla completa.
+**Mejor uso**: ventana estática o adquisiciones periódicas.
 
 #### Buffers circulares
 **Ventajas**:
-- Permite adquisición continua sin copiar datos.
-- Útil si se quiere scroll o trigger continuo.
+- Adquisición continua sin copiar datos.
+- Ideal para modo “rolling” o trigger repetitivo.
 
 **Desventajas**:
-- Más lógica (índices modulo, sincronización con render).
-- Orden de lectura requiere convertir índice circular a lineal.
+- Lógica adicional para ordenar la lectura.
+- Render requiere conversión de índices circulares a lineales.
 
-**Cuándo usar**: visualización en tiempo real con desplazamiento horizontal.
+**Mejor uso**: osciloscopio con desplazamiento horizontal continuo.
 
 #### Structs de señales
 **Ventajas**:
-- Encapsula datos + métricas en una sola entidad.
-- Hace explícito el estado de la señal.
+- Encapsula datos + métricas (min, max, RMS, etc.).
+- Escalable a múltiples canales.
 
 **Desventajas**:
-- Ligera sobrecarga de complejidad.
+- Leve complejidad extra si solo hay un canal.
 
-**Cuándo usar**: cuando se requiere extensibilidad o varias señales.
+**Mejor uso**: arquitectura limpia y extensible.
 
 #### Procesamiento incremental
 **Ventajas**:
-- Reduce memoria y CPU en post‑proceso.
-- Facilita calcular min, max, promedio, RMS en una sola pasada.
+- Estadísticas en una sola pasada.
+- Baja RAM y coste fijo por muestra.
 
 **Desventajas**:
-- Si no se guardan muestras, no se puede dibujar la forma de onda.
+- Sin buffer no hay forma de onda.
 
-**Cuándo usar**: siempre como complemento; imprescindible para estadísticas rápidas.
+**Mejor uso**: siempre como complemento al buffer de dibujo.
 
 #### Fixed‑point vs float
 **Fixed‑point**:
-- Más rápido y predecible en AVR (sin FPU).
-- Menor consumo de flash y CPU.
+- Más rápido en AVR, menor flash y consumo estable.
+- Fácil de mantener un tiempo de muestreo regular.
 
 **Float**:
-- Más simple para cálculos complejos (RMS, dB).
-- Alto costo de CPU, posible jitter en tiempo real.
+- Más simple para dB y RMS “directos”.
+- Costoso en CPU y flash, puede introducir jitter.
 
-**Recomendación**: usar fixed‑point en adquisición y escalado; usar float **solo** fuera del loop crítico si la precisión de dB lo requiere.
+**Recomendación**: fixed‑point para todo el camino crítico; `float` solo si se calcula dB fuera del ciclo de adquisición y es imprescindible.
 
-### 3) Recomendación final justificada
-- **Estructura principal**: arreglo lineal de 108 muestras (`uint8_t` o `uint16_t` si se necesita resolución extra).
-- **Cálculos**: min, max, suma, suma de cuadrados en una pasada (incremental).
-- **Escalado**: mapeo entero a 0–47 para graficar (rápido y estable).
-- **RMS/dB**: fixed‑point con un factor de escala; `log10` aproximado con LUT o, si se permite, calculado en float **después** de adquirir la ventana.
-- **Justificación**: logra baja RAM, CPU estable y código simple. El array lineal es suficiente para 108 muestras y la conversión a gráfico es directa.
+## ✅ Recomendación final (justificada)
+1. **Arreglo lineal de 108 muestras** (ventana fija): simple y perfecto para 108 px de ancho.
+2. **Métricas incrementales** (min, max, suma, suma de cuadrados) durante la adquisición.
+3. **Escalado entero** a 0–47 px con saturación.
+4. **RMS y dB** en fixed‑point o LUT; si se usa `float`, hacerlo posterior a la captura.
+
+**Por qué**: este flujo usa poca RAM, evita cálculos caros dentro del muestreo y mantiene el código comprensible.
 
 ## 💻 Ejemplos en C/C++ (Arduino)
 
-### Estructuras de datos
+### Estructuras de datos (con métricas integradas)
 ```cpp
 #define N_SAMPLES 108
 #define Y_MAX 47
@@ -100,7 +101,7 @@ struct SignalWindow {
 };
 ```
 
-### Adquisición y procesamiento incremental
+### Adquisición + métricas incrementales
 ```cpp
 void acquireWindow(SignalWindow &w) {
   w.minVal = 1023;
@@ -119,40 +120,56 @@ void acquireWindow(SignalWindow &w) {
 }
 ```
 
-### Escalado a 0–47 para graficar
+### Escalado entero a 0–47 px
 ```cpp
 uint8_t scaleToY(uint16_t v, uint16_t minV, uint16_t maxV) {
   if (maxV == minV) return Y_MAX / 2;
-  // Escala entero: (v - min) * Y_MAX / (max - min)
   uint32_t num = (uint32_t)(v - minV) * Y_MAX;
   uint32_t den = (maxV - minV);
   return (uint8_t)(num / den);
 }
 ```
 
-### Cálculo de promedio, RMS y dB (fixed‑point simple)
+### Promedio y RMS (enteros)
 ```cpp
 uint16_t meanQ0(const SignalWindow &w) {
   return (uint16_t)(w.sum / N_SAMPLES);
 }
 
 uint16_t rmsQ0(const SignalWindow &w) {
-  // RMS entero aproximado
   uint32_t meanSq = w.sumSq / N_SAMPLES;
-  // sqrt entero (ej. función rápida o aproximación)
-  return (uint16_t)sqrt((double)meanSq); // reemplazar por sqrt entero si se desea
+  // sqrt entero; reemplazar por implementación rápida si se desea
+  return (uint16_t)sqrt((double)meanSq);
 }
 ```
 
-### Ejemplo de graficado (pseudocódigo con SSD1306)
+### dB con fixed‑point (ejemplo simple)
+```cpp
+// dB = 20 * log10(rms / ref). Usar LUT si se requiere velocidad.
+// Aquí se deja la API preparada para reemplazar el log10.
+int16_t dbQ8(uint16_t rms, uint16_t ref) {
+  if (rms == 0 || ref == 0) return -32768; // -inf
+  // Placeholder: convertir a float fuera del loop crítico
+  float db = 20.0f * log10f((float)rms / (float)ref);
+  return (int16_t)(db * 256.0f); // Q8
+}
+```
+
+### Graficado (conexión de puntos)
 ```cpp
 for (uint8_t x = 0; x < N_SAMPLES - 1; x++) {
   uint8_t y1 = Y_MAX - scaleToY(w.samples[x], w.minVal, w.maxVal);
-  uint8_t y2 = Y_MAX - scaleToY(w.samples[x+1], w.minVal, w.maxVal);
-  display.drawLine(x, y1, x+1, y2, SSD1306_WHITE);
+  uint8_t y2 = Y_MAX - scaleToY(w.samples[x + 1], w.minVal, w.maxVal);
+  display.drawLine(x, y1, x + 1, y2, SSD1306_WHITE);
 }
 ```
 
+## 🧩 Mejoras propuestas sobre lo subido
+- **Separar adquisición y render** en funciones explícitas para controlar timing.
+- **Mantener 10 bits para métricas y 8 bits para render** si se quiere ahorrar RAM en el buffer de gráfico.
+- **Introducir LUT para log10** si el dB debe calcularse en tiempo real.
+- **Opcional**: usar ADC en modo free‑running con interrupción para muestreo más uniforme.
+
 ---
 
-Si necesitas incluir optimización con LUT de `log10`, o trigger y sincronización con timer/ADC en modo free‑running, puedo extender el diseño.
+Si quieres, puedo ajustar el documento con un pipeline de muestreo basado en Timer + ADC free‑running o incluir una LUT real para `log10`.
